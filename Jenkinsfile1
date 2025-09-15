@@ -1,93 +1,136 @@
 pipeline {
     agent any
-
     tools {
-        jdk 'jdk17'                // Ensure JDK 17 is configured in Jenkins
-        nodejs 'node23'            // Node.js version for NPM
+        jdk 'jdk17'
+        nodejs 'node24'
     }
-
     environment {
-        SCANNER_HOME = tool 'sonar-scanner'            // SonarQube scanner
-        SONAR_TOKEN = credentials('Sonar-token')      // Jenkins Sonar token
-        DOCKERHUB_CREDENTIALS = credentials('dockerhub-creds') // Jenkins DockerHub creds
-        REPO_NAME = 'souviksarkar123/bookmyshow' // DockerHub repo
-        IMAGE_NAME = 'bms-app'
+        SCANNER_HOME = tool 'sonar-scanner'
     }
-
     stages {
         stage('Clean Workspace') {
             steps {
                 cleanWs()
             }
         }
-
-        stage('Checkout Code') {
+        stage('Checkout from Git') {
             steps {
                 git branch: 'main', url: 'https://github.com/bikssbunny/Book-My-Show-biks.git'
+                sh 'ls -la'  // Verify files after checkout
             }
         }
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh ''' 
+                    $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=BMS \
+                    -Dsonar.projectKey=BMS 
+                    '''
+                }
+            }
+        }
+        stage('Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
+                }
+            }
+        }
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                cd bookmyshow-app
+                ls -la  # Verify package.json exists
+                if [ -f package.json ]; then
+                    rm -rf node_modules package-lock.json  # Remove old dependencies
+                    npm install  # Install fresh dependencies
+                else
+                    echo "Error: package.json not found in bookmyshow-app!"
+                    exit 1
+                fi
+                '''
+            }
+        }
+        // stage('OWASP FS Scan') {
+        //     steps {
+        //         dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+        //         dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+        //     }
+        // }
+        // stage('Trivy FS Scan') {
+        //     steps {
+        //         sh 'trivy fs . > trivyfs.txt'
+        //     }
+        // }
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
+                        sh ''' 
+                        echo "Building Docker image..."
+                        docker build --no-cache -t souviksarkar123/bms:latest -f bookmyshow-app/Dockerfile bookmyshow-app
 
-stage('SonarQube Analysis') {
-    steps {
-        withSonarQubeEnv('SonarQube') {  
-                sh """
-                ${SCANNER_HOME}/bin/sonar-scanner \
-                -Dsonar.projectKey=souvik-capstone \
-                -Dsonar.projectName=souvik-capstone \
-                -Dsonar.host.url=http://3.9.24.17:9000 \
-                -Dsonar.login=${SONAR_TOKEN}
-                """
+                        echo "Pushing Docker image to registry..."
+                        docker push souviksarkar123/bms:latest
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Deploy to Container') {
+            steps {
+                sh ''' 
+                echo "Stopping and removing old container..."
+                docker stop bms || true
+                docker rm bms || true
+
+                echo "Running new container on port 3000..."
+                docker run -d --restart=always --name bms -p 3000:3000 souviksarkar123/bms:latest
+
+                echo "Checking running containers..."
+                docker ps -a
+
+                echo "Fetching logs..."
+                sleep 5  # Give time for the app to start
+                docker logs bms
+                '''
             }
         }
     }
-
-        stage('Install Dependencies') {
+        stage('Deploy to EKS Cluster') {
             steps {
-                dir('bookmyshow-app') {
-                    sh 'npm install'
+                script {
+                    sh '''
+                    echo "Verifying AWS credentials..."
+                    aws sts get-caller-identity
+
+                    echo "Configuring kubectl for EKS cluster..."
+                    aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
+
+                    echo "Verifying kubeconfig..."
+                    kubectl config view
+
+                    echo "Deploying application to EKS..."
+                    kubectl apply -f deployment.yml
+                    kubectl apply -f service.yml
+
+                    echo "Verifying deployment..."
+                    kubectl get pods
+                    kubectl get svc
+                    '''
                 }
             }
         }
-
-        stage('Docker Build & Push') {
-            steps {
-                dir('bookmyshow-app') {
-                    script {
-                        // Build Docker image
-                        sh "docker build -t ${REPO_NAME}:${env.BUILD_NUMBER} ."
-
-                        // Login to DockerHub
-                        sh "echo ${DOCKERHUB_CREDENTIALS_PSW} | docker login -u ${DOCKERHUB_CREDENTIALS_USR} --password-stdin"
-
-                        // Push image
-                        sh "docker push ${REPO_NAME}:${env.BUILD_NUMBER}"
-                    }
-                }
-            }
-        }
-
-        stage('SonarQube Analysis') {
-            steps {
-                withSonarQubeEnv('SonarQube') {
-                    withEnv([
-                        "JAVA_HOME=${tool 'jdk17'}",
-                        "PATH+JAVA=${tool 'jdk17'}/bin"
-                    ]) {
-                        sh """
-                        ${SCANNER_HOME}/bin/sonar-scanner \
-                        -Dsonar.projectKey=souvik-capstone \
-                        -Dsonar.projectName=souvik-capstone \
-                        -Dsonar.host.url=http://3.9.24.17:9000 \
-                        -Dsonar.login=${SONAR_TOKEN}
-                        """
-                    }
-                }
-            }
-        }
-
+    }
     post {
         always {
-            echo "Pipeline finished. Email notifications are disabled."
+            emailext attachLog: true,
+                subject: "'${currentBuild.result}'",
+                body: "Project: ${env.JOB_NAME}<br/>" +
+                      "Build Number: ${env.BUILD_NUMBER}<br/>" +
+                      "URL: ${env.BUILD_URL}<br/>",
+                to: 'biksbunny154@gmail.com'
+                // attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
         }
     }
 }
